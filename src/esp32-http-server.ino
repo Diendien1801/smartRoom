@@ -1,109 +1,186 @@
-/* ESP32 HTTP IoT Server Example for Wokwi.com
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h> 
+#include <Keypad.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
 
-  https://wokwi.com/arduino/projects/320964045035274834
 
-  When running it on Wokwi for VSCode, you can connect to the 
-  simulated ESP32 server by opening http://localhost:8180
-  in your browser. This is configured by wokwi.toml.
-*/
+#define ROW_NUM 4 
+#define COLUMN_NUM 4 
 
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <WebServer.h>
-#include <uri/UriBraces.h>
+char keys[ROW_NUM][COLUMN_NUM] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte pin_rows[ROW_NUM] = {19, 18, 5, 17}; 
+byte pin_column[COLUMN_NUM] = {16, 4, 0, 2}; 
+Keypad keypad = Keypad(makeKeymap(keys), pin_rows, pin_column, ROW_NUM, COLUMN_NUM);
 
-#define WIFI_SSID "Wokwi-GUEST"
-#define WIFI_PASSWORD ""
-// Defining the WiFi channel speeds up the connection:
-#define WIFI_CHANNEL 6
+// Khởi tạo LCD với địa chỉ I2C (0x27 hoặc 0x3F)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-WebServer server(80);
+// Chân kết nối Ultrasonic
+const int trigPin = 26;
+const int echoPin = 25;
 
-const int LED1 = 26;
-const int LED2 = 27;
+// Chân kết nối Servo
+Servo myServo;
+const int servoPin = 33;
 
-bool led1State = false;
-bool led2State = false;
+// Đặt khoảng cách tối thiểu để LCD sáng lên (đơn vị cm)
+const int distanceThreshold = 100;
 
-void sendHtml() {
-  String response = R"(
-    <!DOCTYPE html><html>
-      <head>
-        <title>ESP32 Web Server Demo</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          html { font-family: sans-serif; text-align: center; }
-          body { display: inline-flex; flex-direction: column; }
-          h1 { margin-bottom: 1.2em; } 
-          h2 { margin: 0; }
-          div { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto auto; grid-auto-flow: column; grid-gap: 1em; }
-          .btn { background-color: #5B5; border: none; color: #fff; padding: 0.5em 1em;
-                 font-size: 2em; text-decoration: none }
-          .btn.OFF { background-color: #333; }
-        </style>
-      </head>
-            
-      <body>
-        <h1>ESP32 Web Server</h1>
+String inputCode = "";
+const String correctCode = "123"; 
 
-        <div>
-          <h2>LED 1</h2>
-          <a href="/toggle/1" class="btn LED1_TEXT">LED1_TEXT</a>
-          <h2>LED 2</h2>
-          <a href="/toggle/2" class="btn LED2_TEXT">LED2_TEXT</a>
-        </div>
-      </body>
-    </html>
-  )";
-  response.replace("LED1_TEXT", led1State ? "ON" : "OFF");
-  response.replace("LED2_TEXT", led2State ? "ON" : "OFF");
-  server.send(200, "text/html", response);
-}
+unsigned long lastDistanceCheck = 0; // Thời gian lần cuối đo khoảng cách
+const unsigned long distanceInterval = 200; // Kiểm tra khoảng cách mỗi 200ms
+unsigned long grantTime = 0;
+bool accessGranted = false;
+int distance = 0;
+// Thông tin Wi-Fi
+const char* ssid = "Wokwi-GUEST";     
+const char* password = ""; 
 
-void setup(void) {
+void setup() {
   Serial.begin(115200);
-  pinMode(LED1, OUTPUT);
-  pinMode(LED2, OUTPUT);
+  
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
-  Serial.print("Connecting to WiFi ");
-  Serial.print(WIFI_SSID);
-  // Wait for connection
   while (WiFi.status() != WL_CONNECTED) {
-    delay(100);
+    delay(500);
     Serial.print(".");
   }
-  Serial.println(" Connected!");
 
-  Serial.print("IP address: ");
+  Serial.println("Connected to Wi-Fi!");
+  Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 
-  server.on("/", sendHtml);
+  // Khởi tạo LCD và bật đèn nền
+  Wire.begin(14, 22); // SDA = GPIO 14, SCL = GPIO 22
+  lcd.init();
+  lcd.noBacklight();  // Đèn nền tắt khi bắt đầu
 
-  server.on(UriBraces("/toggle/{}"), []() {
-    String led = server.pathArg(0);
-    Serial.print("Toggle LED #");
-    Serial.println(led);
+  // Cấu hình chân Trig và Echo
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
 
-    switch (led.toInt()) {
-      case 1:
-        led1State = !led1State;
-        digitalWrite(LED1, led1State);
-        break;
-      case 2:
-        led2State = !led2State;
-        digitalWrite(LED2, led2State);
-        break;
-    }
-
-    sendHtml();
-  });
-
-  server.begin();
-  Serial.println("HTTP server started (http://localhost:8180)");
+  // Gán servo vào chân GPIO
+  myServo.attach(servoPin);
+  myServo.write(90);  // Servo bắt đầu ở góc 90 độ
 }
 
-void loop(void) {
-  server.handleClient();
-  delay(2);
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Kiểm tra khoảng cách mỗi khoảng thời gian nhất định
+  if (currentMillis - lastDistanceCheck >= distanceInterval) {
+    lastDistanceCheck = currentMillis;
+    checkDistance();
+  }
+
+  // Xử lý bàn phím
+  handleKeypadInput();
+
+  // Quản lý trạng thái cấp quyền
+  if (accessGranted && (millis() - grantTime >= 2000)) {
+    resetAccess();
+  }
+}
+
+void checkDistance() {
+  // Gửi tín hiệu sóng siêu âm
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // Đo thời gian phản hồi
+  long duration = pulseIn(echoPin, HIGH);
+
+  // Tính toán khoảng cách (tính bằng cm)
+  distance = duration * 0.034 / 2;
+
+  if (distance <= distanceThreshold) {
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("Xin chao      "); // Hiển thị "Xin chao"
+  } else {
+    lcd.noBacklight();
+    lcd.clear();
+  }
+}
+
+void handleKeypadInput() {
+  char key = keypad.getKey();
+  if (key) {
+    Serial.println(key);
+    if (key == '#') { // Reset mã nhập
+      inputCode = "";
+      lcd.setCursor(0, 1);
+      lcd.print("Reset code   ");
+    } else {
+      inputCode += key;
+      lcd.setCursor(0, 1);
+      lcd.print("Code: " + inputCode + "      ");
+
+      if (inputCode == correctCode) { // Kiểm tra mã nhập đúng
+        sendHttpRequest(); // Gửi yêu cầu HTTP khi mã đúng
+      } else if (inputCode.length() >= correctCode.length() && inputCode != correctCode) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Sai ma!      ");
+        delay(1000); // Hiển thị thông báo 1 giây
+        inputCode = ""; // Reset mã nhập
+        lcd.clear();
+      }
+    }
+  }
+}
+
+void sendHttpRequest() {
+  HTTPClient http;
+
+  // URL API
+  String url = "http://192.168.1.2:3000/api/validate-booking?otp=22127323&room=2&mock=true";  
+
+  // Gửi yêu cầu GET
+  http.begin(url);
+  int httpCode = http.GET();  // Thực hiện yêu cầu GET
+
+  if (httpCode > 0) { // Kiểm tra mã phản hồi HTTP
+    String payload = http.getString(); // Lấy dữ liệu trả về
+    Serial.println(payload); // In kết quả
+
+    // Kiểm tra phản hồi từ server
+    if (payload == "true") {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Thành công   ");
+      myServo.write(0); // Servo quay về góc 0 độ
+      accessGranted = true;
+      grantTime = millis();
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Thất bại     ");
+      delay(1000); // Hiển thị thông báo thất bại
+    }
+  } else {
+    Serial.println("Error on HTTP request");
+  }
+
+  http.end(); // Kết thúc yêu cầu HTTP
+}
+
+void resetAccess() {
+  accessGranted = false;
+  inputCode = ""; // Reset mã nhập
+  myServo.write(90); // Servo quay về góc 90 độ
+  lcd.clear();
 }
