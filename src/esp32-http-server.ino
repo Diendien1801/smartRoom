@@ -32,9 +32,10 @@ const int servoPin = 33;
 
 // Đặt khoảng cách tối thiểu để LCD sáng lên (đơn vị cm)
 const int distanceThreshold = 100;
-
+// Chân kết nối PIR
+const int PIR_PIN = 15; 
 String inputCode = "";
-const String correctCode = "123"; 
+ 
 
 unsigned long lastDistanceCheck = 0; // Thời gian lần cuối đo khoảng cách
 const unsigned long distanceInterval = 200; // Kiểm tra khoảng cách mỗi 200ms
@@ -45,6 +46,13 @@ int distance = 0;
 const char* ssid = "Wokwi-GUEST";     
 const char* password = ""; 
 
+
+// Timer intervals
+#define CHECK_INTERVAL 1 // 15 minutes in milliseconds
+#define DISABLE_INTERVAL 3600000 // 1 hour in milliseconds
+unsigned long lastCheckTime = 0;
+unsigned long lastCancelTime = 0;
+bool pirEnabled = true;
 void setup() {
   Serial.begin(115200);
   
@@ -72,11 +80,28 @@ void setup() {
   // Gán servo vào chân GPIO
   myServo.attach(servoPin);
   myServo.write(90);  // Servo bắt đầu ở góc 90 độ
+  pinMode(PIR_PIN, INPUT); 
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
+  // Check for motion every 15 minutes
+  if (currentMillis - lastCheckTime >= CHECK_INTERVAL) {
+    lastCheckTime = currentMillis;
+
+    if (pirEnabled && digitalRead(PIR_PIN) == LOW) {
+      // No motion detected, call API to cancel room
+      cancelRoom();
+      pirEnabled = false;
+      lastCancelTime = currentMillis;
+    }
+  }
+
+  // Re-enable PIR sensor after 1 hour
+  if (!pirEnabled && currentMillis - lastCancelTime >= DISABLE_INTERVAL) {
+    pirEnabled = true;
+  }
   // Kiểm tra khoảng cách mỗi khoảng thời gian nhất định
   if (currentMillis - lastDistanceCheck >= distanceInterval) {
     lastDistanceCheck = currentMillis;
@@ -87,7 +112,7 @@ void loop() {
   handleKeypadInput();
 
   // Quản lý trạng thái cấp quyền
-  if (accessGranted && (millis() - grantTime >= 2000)) {
+  if (accessGranted && (millis() - grantTime >= 1000)) {
     resetAccess();
   }
 }
@@ -106,11 +131,11 @@ void checkDistance() {
   // Tính toán khoảng cách (tính bằng cm)
   distance = duration * 0.034 / 2;
 
-  if (distance <= distanceThreshold) {
+  if (distance <= distanceThreshold && !accessGranted) {
     lcd.backlight();
     lcd.setCursor(0, 0);
-    lcd.print("Xin chao      "); // Hiển thị "Xin chao"
-  } else {
+    lcd.print("Hello      "); // Hiển thị "Xin chao"
+  } else if (!accessGranted) {
     lcd.noBacklight();
     lcd.clear();
   }
@@ -129,9 +154,10 @@ void handleKeypadInput() {
       lcd.setCursor(0, 1);
       lcd.print("Code: " + inputCode + "      ");
 
-      if (inputCode == correctCode) { // Kiểm tra mã nhập đúng
-        sendHttpRequest(); // Gửi yêu cầu HTTP khi mã đúng
-      } else if (inputCode.length() >= correctCode.length() && inputCode != correctCode) {
+      if (inputCode.length() == 3) { // Kiểm tra mã nhập đủ 3 chữ số
+        sendHttpRequest(inputCode); // Gửi yêu cầu HTTP với OTP
+        inputCode = ""; // Reset mã nhập sau khi gửi yêu cầu
+      } else if (inputCode.length() > 3) {
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("Sai ma!      ");
@@ -143,11 +169,11 @@ void handleKeypadInput() {
   }
 }
 
-void sendHttpRequest() {
+void sendHttpRequest(String otp) {
   HTTPClient http;
 
-  // URL API
-  String url = "http://192.168.1.2:3000/api/validate-booking?otp=22127323&room=2&mock=true";  
+  // URL API với tham số OTP
+  String url = "http://192.168.1.2:3000/api/validate-booking?room=2&otp=" + otp;  
 
   // Gửi yêu cầu GET
   http.begin(url);
@@ -161,21 +187,23 @@ void sendHttpRequest() {
     if (payload == "true") {
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("Thành công   ");
+      lcd.print("Access granted  ");
       myServo.write(0); // Servo quay về góc 0 độ
       accessGranted = true;
       grantTime = millis();
+      delay(2000); // Hiển thị thông báo 2 giây
+      lcd.clear();
     } else {
       lcd.clear();
       lcd.setCursor(0, 0);
-      lcd.print("Thất bại     ");
+      lcd.print("Wrong code     ");
       delay(1000); // Hiển thị thông báo thất bại
     }
   } else {
     Serial.println("Error on HTTP request");
   }
 
-  http.end(); // Kết thúc yêu cầu HTTP
+  http.end();
 }
 
 void resetAccess() {
@@ -183,4 +211,53 @@ void resetAccess() {
   inputCode = ""; // Reset mã nhập
   myServo.write(90); // Servo quay về góc 90 độ
   lcd.clear();
+}
+void cancelRoom() {
+  HTTPClient http;
+  String url = "http://192.168.1.2:3000/api/cancel-booking?room=2";
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.println(payload);
+
+    if (payload == "true") {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      //lcd.print("Room canceled  ");
+      myServo.write(0);
+      accessGranted = false;
+      sendPushNotification("Room 2 canceled ");
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      //lcd.print("Error canceling");
+      sendPushNotification("Room 2 canceled ");
+    }
+  } else {
+    Serial.println("Lỗi khi gửi yêu cầu HTTP");
+  }
+
+  http.end();
+}
+
+void sendPushNotification(String message) {
+  HTTPClient http;
+  String url = "https://www.pushsafer.com/api";
+  String postData = "k=W4xYgztg4UbKqlFXboWR&t=Room%20Cancellation&m=" + message;
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int httpCode = http.POST(postData);
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.println(payload);
+  } else {
+    Serial.println("Error sending push notification");
+  }
+
+  http.end();
 }
